@@ -1,0 +1,4 @@
+[
+  {"prompt": "解释 RLHF 是什么", "response": "RLHF 是一种利用人类反馈对大模型进行强化训练的方法。"},
+  {"prompt": "什么是 SFT", "response": "SFT 是监督式微调，让模型更符合特定任务。"}
+]
