@@ -13,7 +13,8 @@ from typing import List, Dict
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
+from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
 
 # ---------- 数据：SFT 用 prompt+response，PPO 只用 prompt ----------
@@ -48,6 +49,22 @@ class PromptDataset(Dataset):
         return {"prompt": self.prompts[idx]}#按索引取一条样本，返回字典（prompt）
 
 
+def sft_collate_fn(batch, pad_token_id: int = 0):
+    """将多条 SFT 样本 pad 到同一长度再 stack，供 batch_size>1 使用。"""
+    input_ids = [x["input_ids"] for x in batch]
+    attention_mask = [x["attention_mask"] for x in batch]
+    labels = [x["labels"] for x in batch]
+    max_len = max(x.size(0) for x in input_ids)
+    pad_input = [F.pad(x, (0, max_len - x.size(0)), value=pad_token_id) for x in input_ids]
+    pad_attn = [F.pad(x, (0, max_len - x.size(0)), value=0) for x in attention_mask]
+    pad_labels = [F.pad(x, (0, max_len - x.size(0)), value=-100) for x in labels]
+    return {
+        "input_ids": torch.stack(pad_input),
+        "attention_mask": torch.stack(pad_attn),
+        "labels": torch.stack(pad_labels),
+    }
+
+
 # ---------- PPO 用：reward、生成、logprob、单步更新 ----------
 def compute_reward(prompt: str, response: str) -> float:#输入 prompt 和 response 文本，输出一个标量奖励
     length = len(response)#计算 response 长度
@@ -67,30 +84,43 @@ def compute_reward(prompt: str, response: str) -> float:#输入 prompt 和 respo
 
 
 @torch.no_grad()
-def generate_responses(model, tokenizer, prompts: List[str], device: torch.device,
-                       max_input_length: int = 256, max_new_tokens: int = 64):#用当前模型对一批 prompt 生成回复
-    model.eval()#模型评估模式
-    all_input_ids, all_attention_mask, prompt_lens = [], [], []#存每个样本的生成序列、mask、以及 prompt 长度
-    for prompt in prompts:#遍历每条 prompt
-        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_length)#
-        input_ids = enc["input_ids"]#获取 input_ids
-        attention_mask = enc["attention_mask"]#获取 attention_mask
-        prompt_len = input_ids.size(1)#获取 prompt 长度
-        output_ids = model.generate(#生成回复
-            input_ids=input_ids.to(device),#转成 device 上 tensor
-            attention_mask=attention_mask.to(device),#转成 device 上 tensor
-            max_new_tokens=max_new_tokens,#最大生成 tokens 数
-            do_sample=True,#采样
-            temperature=1.0,#温度
-            top_p=0.9,#top-p 采样
-        )
-        all_input_ids.append(output_ids.cpu())#存生成序列
-        all_attention_mask.append((output_ids != tokenizer.pad_token_id).long())#存 mask
-        prompt_lens.append(prompt_len)#存 prompt 长度
-    input_ids = torch.cat(all_input_ids, dim=0)#拼接成 batch tensor
-    attention_mask = torch.cat(all_attention_mask, dim=0)#拼接成 batch tensor
-    texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)#解码成文本
-    return input_ids, attention_mask, prompt_lens, texts#返回 input_ids, attention_mask, prompt_lens, texts
+def generate_responses_with_logprobs(
+    model, tokenizer, prompts: List[str], device: torch.device,
+    max_input_length: int = 256, max_new_tokens: int = 64,
+):
+    """生成回复并在每步记录采样 token 的 log 概率，返回 log_probs_old（无需 old_policy）。"""
+    model.eval()
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
+    encoded = [tokenizer(p, return_tensors="pt", truncation=True, max_length=max_input_length) for p in prompts]
+    max_pl = max(enc["input_ids"].size(1) for enc in encoded)
+    prompt_lens = [enc["input_ids"].size(1) for enc in encoded]
+    input_ids = []
+    attention_mask = []
+    for enc in encoded:
+        ids = enc["input_ids"].squeeze(0)
+        attn = enc["attention_mask"].squeeze(0)
+        if ids.size(0) < max_pl:
+            ids = F.pad(ids, (0, max_pl - ids.size(0)), value=pad_id)
+            attn = F.pad(attn, (0, max_pl - attn.size(0)), value=0)
+        input_ids.append(ids)
+        attention_mask.append(attn)
+    input_ids = torch.stack(input_ids).to(device)
+    attention_mask = torch.stack(attention_mask).to(device)
+
+    all_token_logprobs = []
+    for _ in range(max_new_tokens):
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits[:, -1, :]
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        next_tokens = torch.multinomial(log_probs.exp(), num_samples=1)
+        token_log_probs = log_probs.gather(dim=-1, index=next_tokens).squeeze(-1)
+        all_token_logprobs.append(token_log_probs)
+        input_ids = torch.cat([input_ids, next_tokens], dim=1)
+        attention_mask = torch.cat([attention_mask, torch.ones_like(next_tokens, device=device)], dim=1)
+
+    log_probs_old = torch.stack(all_token_logprobs, dim=1).mean(dim=1)
+    texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+    return input_ids, attention_mask, prompt_lens, texts, log_probs_old
 
 
 def sequence_logprob(model, input_ids, attention_mask, prompt_lens: List[int], device: torch.device):
@@ -112,15 +142,13 @@ def sequence_logprob(model, input_ids, attention_mask, prompt_lens: List[int], d
     return torch.stack(logprobs_per_sample, dim=0)
 
 
-def ppo_update_step(policy_model, old_policy_model, tokenizer, prompts: List[str], device, optimizer,
+def ppo_update_step(policy_model, tokenizer, prompts: List[str], device, optimizer,
                     kl_coef: float = 0.1, clip_range: float = 0.2) -> Dict[str, float]:
     with torch.no_grad():
-        input_ids, attention_mask, prompt_lens, texts = generate_responses(
+        input_ids, attention_mask, prompt_lens, texts, logprob_old = generate_responses_with_logprobs(
             policy_model, tokenizer, prompts, device=device)
     rewards = [compute_reward(p, t) for p, t in zip(prompts, texts)]
     rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        logprob_old = sequence_logprob(old_policy_model, input_ids, attention_mask, prompt_lens, device)
     policy_model.train()
     logprob_new = sequence_logprob(policy_model, input_ids, attention_mask, prompt_lens, device)
     advantages = rewards_t - rewards_t.mean()
@@ -162,7 +190,7 @@ def run_sft_phase(model, tokenizer, sft_dataloader, optimizer, device: torch.dev
             print(f"  [SFT] step={step + 1}/{steps} loss={loss.item():.4f}")
 
 
-def run_ppo_phase(policy_model, old_policy_model, tokenizer, ppo_dataloader, optimizer, device: torch.device, steps: int):
+def run_ppo_phase(policy_model, tokenizer, ppo_dataloader, optimizer, device: torch.device, steps: int):
     """对当前策略做 steps 步 PPO 更新（就地更新 policy_model）。"""
     ppo_iter = iter(ppo_dataloader)
     for step in range(steps):
@@ -172,44 +200,50 @@ def run_ppo_phase(policy_model, old_policy_model, tokenizer, ppo_dataloader, opt
             ppo_iter = iter(ppo_dataloader)
             batch = next(ppo_iter)
         prompts = batch["prompt"]
-        stats = ppo_update_step(policy_model, old_policy_model, tokenizer, prompts, device, optimizer)
+        stats = ppo_update_step(policy_model, tokenizer, prompts, device, optimizer)
         if (step + 1) % 1 == 0:
             print(f"  [PPO] step={step + 1}/{steps} loss={stats['loss']:.4f} reward_mean={stats['reward_mean']:.4f} kl={stats['kl']:.4f}")
 
 
 def main():
-    base_model_path = r"./models/Qwen2-0.5B"
-    sft_data_path = r"./data/sft_data.json"
-    output_dir = r"./qwen2_0.5b_mixed_cpu"
+    # 使用绝对路径，避免新版 huggingface_hub 把本地路径当 repo_id 校验报错
+    _root = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    base_model_path = os.path.join(_root, "models", "qwen2-7b")
+    sft_data_path = os.path.join(_root, "data", "sft_data.json")
+    output_dir = os.path.join(_root, "qwen2_7b_mixed")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
         torch.set_num_threads(max(1, os.cpu_count() // 2))
     print(f"使用设备: {device}")
 
-    # 从基座加载（若想从已有 SFT 开始，可改为 sft_checkpoint_path）
+    # 从基座加载，只保留一个 policy（生成时存 log π_old，无需 old_policy）
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
-    model = AutoModelForCausalLM.from_pretrained(base_model_path).to(device)
-    old_policy_model = AutoModelForCausalLM.from_pretrained(base_model_path).to(device)
-    old_policy_model.eval()
+    model = Qwen2ForCausalLM.from_pretrained(base_model_path).to(device)
 
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
     sft_dataset = SFTJsonDataset(sft_data_path, tokenizer)
-    sft_dataloader = DataLoader(sft_dataset, batch_size=1, shuffle=True, num_workers=0)
+    sft_dataloader = DataLoader(
+        sft_dataset,
+        batch_size=10,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=lambda b: sft_collate_fn(b, pad_token_id=pad_token_id),
+    )
     ppo_dataset = PromptDataset(sft_data_path)
-    ppo_dataloader = DataLoader(ppo_dataset, batch_size=1, shuffle=True, num_workers=0)
+    ppo_dataloader = DataLoader(ppo_dataset, batch_size=10, shuffle=True, num_workers=0)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
-    num_rounds = 2
+    num_rounds = 2  # SFT → PPO → SFT → PPO（两轮）
     sft_steps_per_round = 2
     ppo_steps_per_round = 2
 
-    print("SFT 与 RL 交替训练（CPU，每轮步数较小，会较慢）")
+    print("SFT 与 RL 交替训练（单 policy，生成时存 log π_old，全程 GPU）")
     for r in range(num_rounds):
         print(f"--- Round {r + 1}/{num_rounds} ---")
         run_sft_phase(model, tokenizer, sft_dataloader, optimizer, device, sft_steps_per_round)
-        old_policy_model.load_state_dict(model.state_dict())
-        run_ppo_phase(model, old_policy_model, tokenizer, ppo_dataloader, optimizer, device, ppo_steps_per_round)
+        run_ppo_phase(model, tokenizer, ppo_dataloader, optimizer, device, ppo_steps_per_round)
 
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
