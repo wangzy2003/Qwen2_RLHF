@@ -11,12 +11,17 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 def main():
-    model_dir = r"./qwen2_0.5b_mixed_cpu"  # 优先用交替训练得到的模型
+    # 项目根 = scripts 的上一级，与 train_qwen2_mixed 的 output_dir 同级（切勿少一层 dirname）
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    model_dir = os.path.abspath(
+        os.path.expanduser(os.environ.get("CHAT_MODEL_DIR", os.path.join(_root, "qwen2_1.5b_mixed")))
+    )
+    kw = {"local_files_only": True, "trust_remote_code": True}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("加载模型与分词器...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(model_dir).to(device)
+    print(f"加载模型与分词器: {model_dir} ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, **kw)
+    model = AutoModelForCausalLM.from_pretrained(model_dir, **kw).to(device)
     model.eval()
 
     print("输入问题后回车生成回答，输入 quit 或 exit 退出。\n")
