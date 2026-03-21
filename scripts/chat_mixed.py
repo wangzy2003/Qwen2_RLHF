@@ -1,6 +1,8 @@
 """
 命令行对话：加载 mixed 模型，输入问题后生成回答并打印。
 用法：python scripts/chat_mixed.py
+
+推理格式与 train_qwen2_mixed.py 的 SFT 一致：「用户: 问题」换行「助手:」再接生成内容。
 """
 import os
 os.environ["TRANSFORMERS_NO_TF"] = "1"
@@ -8,6 +10,15 @@ os.environ["TRANSFORMERS_NO_FLAX"] = "1"
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
+def strip_optional_user_prefix(text: str) -> str:
+    """去掉用户误输入的「你：」「用户:」等前缀，避免与模板重复。"""
+    t = text.strip()
+    for p in ("你：", "你:", "用户：", "用户:"):
+        if t.startswith(p):
+            t = t[len(p) :].lstrip()
+    return t
 
 
 def main():
@@ -35,31 +46,41 @@ def main():
         if prompt.lower() in ("quit", "exit", "q"):
             break
 
+        user_content = strip_optional_user_prefix(prompt)
+        # 与 SFT 完全一致：模型只负责续写「助手:」之后的内容
+        full_prompt = f"用户: {user_content}\n助手:"
+
         enc = tokenizer(
-            prompt,
+            full_prompt,
             return_tensors="pt",
             truncation=True,
             max_length=512,
         )
         input_ids = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
+        eos_id = tokenizer.eos_token_id
 
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=128,
+                max_new_tokens=256,
                 do_sample=True,
-                temperature=0.8,
-                top_p=0.9,
-                repetition_penalty=1.3,  # 惩罚已出现过的 token
-                no_repeat_ngram_size=3,  # 禁止重复出现相同的 3 个连续词
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                temperature=0.7,
+                top_p=0.92,
+                repetition_penalty=1.25,
+                no_repeat_ngram_size=4,
+                pad_token_id=tokenizer.pad_token_id or eos_id,
+                eos_token_id=eos_id,
             )
 
         # 只保留新生成的部分
         gen_ids = output_ids[:, input_ids.size(1) :]
         reply = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+        # 若模型又编出下一轮「用户:」，截断，避免整段胡话
+        for stop in ("\n用户:", "\n用户："):
+            if stop in reply:
+                reply = reply.split(stop, 1)[0].strip()
         print("模型:", reply)
         print()
 
