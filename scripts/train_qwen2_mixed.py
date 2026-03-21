@@ -7,14 +7,120 @@ os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["TRANSFORMERS_NO_FLAX"] = "1"
 
 import json
+import urllib.error
+import urllib.request
+from collections import Counter
 from pathlib import Path
-from typing import List, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+
+
+# ---------- 自动敏感词：下载词库 + 子串匹配（非「理解语义」的 AI 判别）----------
+_SENSITIVE_LEXICON: Optional[Tuple[str, Any]] = None
+
+# 公开词库镜像（任一成功即可）；离线时请自行放置 data/sensitive_words_zh.txt
+_SENSITIVE_WORDLIST_URLS = (
+    "https://raw.githubusercontent.com/observerss/textfilter/master/sensitive_words.txt",
+    "https://cdn.jsdelivr.net/gh/observerss/textfilter@master/sensitive_words.txt",
+)
+
+
+def _project_root_path() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _download_sensitive_word_file(dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for url in _SENSITIVE_WORDLIST_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Qwen2-SFT-CPU/1.0)"})
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            if len(raw.strip()) < 80:
+                continue
+            dest.write_text(raw, encoding="utf-8")
+            return True
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+    return False
+
+
+def prepare_sensitive_lexicon(project_root: Path) -> None:
+    """
+    若 data/sensitive_words_zh.txt 不存在或过小，尝试自动下载开源词库。
+    仍失败则仅用英文粗口检测（better-profanity，可选安装）+ 环境变量 REWARD_BAD_WORDS。
+    """
+    global _SENSITIVE_LEXICON
+    _SENSITIVE_LEXICON = None
+    path = project_root / "data" / "sensitive_words_zh.txt"
+    if not path.exists() or path.stat().st_size < 80:
+        if _download_sensitive_word_file(path):
+            print(f"已自动下载中文敏感词库: {path}")
+        else:
+            print(
+                "提示: 未能联网下载敏感词库。可手动下载词表保存为 data/sensitive_words_zh.txt ，"
+                "或 pip install better-profanity 以启用英文粗口检测。"
+            )
+
+
+def _load_sensitive_lexicon() -> Tuple[str, Any]:
+    """返回 (mode, payload)：aho | naive | none"""
+    global _SENSITIVE_LEXICON
+    if _SENSITIVE_LEXICON is not None:
+        return _SENSITIVE_LEXICON
+
+    path = _project_root_path() / "data" / "sensitive_words_zh.txt"
+    words: List[str] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            w = line.strip().split("#")[0].strip()
+            if len(w) >= 2:
+                words.append(w)
+    # 去重并限制规模，避免无 ahocorasick 时子串匹配过慢
+    words = list(dict.fromkeys(words))[:6000]
+
+    if not words:
+        _SENSITIVE_LEXICON = ("none", None)
+        return _SENSITIVE_LEXICON
+
+    try:
+        import ahocorasick as ah  # type: ignore
+
+        automaton = ah.Automaton()
+        for w in words:
+            automaton.add_word(w, w)
+        automaton.make_automaton()
+        _SENSITIVE_LEXICON = ("aho", automaton)
+    except ImportError:
+        _SENSITIVE_LEXICON = ("naive", frozenset(words))
+
+    return _SENSITIVE_LEXICON
+
+
+def _count_sensitive_lexicon_hits(text: str) -> int:
+    mode, data = _load_sensitive_lexicon()
+    if mode == "none":
+        return 0
+    if mode == "naive":
+        return sum(1 for w in data if w in text)
+    seen = set()
+    for _, w in data.iter(text):
+        seen.add(w)
+    return len(seen)
+
+
+def _english_profanity_hit(text: str) -> bool:
+    try:
+        from better_profanity import profanity
+
+        return profanity.contains_profanity(text)
+    except ImportError:
+        return False
 
 
 # ---------- 数据：SFT 用 prompt+response，PPO 只用 prompt ----------
@@ -66,21 +172,72 @@ def sft_collate_fn(batch, pad_token_id: int = 0):
 
 
 # ---------- PPO 用：reward、生成、logprob、单步更新 ----------
-def compute_reward(prompt: str, response: str) -> float:#输入 prompt 和 response 文本，输出一个标量奖励
-    length = len(response)#计算 response 长度
-    if length < 20:
+def compute_reward(prompt: str, response: str) -> float:
+    """
+    启发式奖励。旧版强依赖「RLHF/SFT」等关键词，与 COIG 等开放域数据严重错配。
+
+    当前设计（可按实验调权重）：
+      - 平滑长度：过短/过长渐近惩罚，避免硬阈值抖动
+      - 重复：单字占比过高视为刷屏，轻罚
+      - 中文：回复中含一定比例汉字时小幅奖励（中文指令数据）
+      - 敏感词：自动加载 data/sensitive_words_zh.txt（首次可联网下载开源词表）；可选 pip install better-profanity 检英文粗口
+      - 额外：环境变量 REWARD_BAD_WORDS=词1,词2 与自动词库叠加
+
+    说明：子串匹配≠语义理解，仍有漏报/误报；严肃场景请用审核 API 或专用分类模型。
+    """
+    text = (response or "").strip()
+    if not text:
+        return -2.0
+
+    n = len(text)
+
+    # --- 1) 平滑长度分：理想段内给正分，向外渐弱 ---
+    lo, hi = 24, 1200  # 字符级；可按 max_new_tokens 调 hi
+    if n < 8:
         length_score = -1.0
-    elif length > 200:
-        length_score = -1.0
+    elif n < lo:
+        length_score = -0.5 + 0.5 * (n - 8) / (lo - 8)  # [-0.5, 0) 附近
+    elif n <= hi:
+        length_score = 0.35
     else:
-        length_score = 1.0
-    keywords = ["RLHF", "SFT", "强化学习"]
-    keyword_hits = sum(1 for kw in keywords if kw in response)#统计 response 中包含的关键词数量
-    keyword_score = 0.5 * keyword_hits#关键词得分
-    bad_words = ["脏话1", "脏话2"]
-    bad_hits = sum(1 for bw in bad_words if bw in response)#统计 response 中包含的脏话数量
-    bad_score = -1.0 * bad_hits#脏话得分
-    return float(length_score + keyword_score + bad_score)#返回总得分
+        overflow = min(n - hi, 2000)
+        length_score = 0.35 - 0.35 * (overflow / 2000.0)
+
+    # --- 2) 重复惩罚：最高频字符占比 ---
+    if n >= 16:
+        top_freq = Counter(text).most_common(1)[0][1]
+        top_ratio = top_freq / n
+        if top_ratio > 0.35:
+            repeat_penalty = -0.6
+        elif top_ratio > 0.22:
+            repeat_penalty = -0.25
+        else:
+            repeat_penalty = 0.0
+    else:
+        repeat_penalty = 0.0
+
+    # --- 3) 中文占比小奖（prompt 含中文时略增权，避免英文任务被误伤）---
+    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    cjk_ratio = cjk / n
+    prompt_cjk = any("\u4e00" <= c <= "\u9fff" for c in prompt)
+    if prompt_cjk and cjk_ratio >= 0.08:
+        lang_bonus = min(0.15, 0.15 * (cjk_ratio / 0.3))
+    else:
+        lang_bonus = 0.0
+
+    # --- 4) 敏感词 / 粗口：自动词库 + 环境变量追加 ---
+    lex_hits = _count_sensitive_lexicon_hits(text)
+    bad_score = -0.45 * min(lex_hits, 12)
+    if _english_profanity_hit(text):
+        bad_score -= 0.55
+    extra_bad = [w.strip() for w in os.environ.get("REWARD_BAD_WORDS", "").split(",") if w.strip()]
+    bad_score -= 1.0 * sum(1 for bw in extra_bad if bw in text)
+
+    # --- 5) 可选领域关键词小奖（不写环境变量则为 0）---
+    domain_kw = [w.strip() for w in os.environ.get("REWARD_DOMAIN_KEYWORDS", "").split(",") if w.strip()]
+    domain_bonus = 0.08 * sum(1 for kw in domain_kw if kw in text)
+
+    return float(length_score + repeat_penalty + lang_bonus + bad_score + domain_bonus)
 
 
 @torch.no_grad()
@@ -208,9 +365,11 @@ def run_ppo_phase(policy_model, tokenizer, ppo_dataloader, optimizer, device: to
 def main():
     # 使用绝对路径，避免新版 huggingface_hub 把本地路径当 repo_id 校验报错
     _root = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    base_model_path = os.path.join(_root, "models", "qwen2-7b")
-    sft_data_path = os.path.join(_root, "data", "sft_data.json")
-    output_dir = os.path.join(_root, "qwen2_7b_mixed")
+    prepare_sensitive_lexicon(Path(_root))
+
+    base_model_path = os.path.join(_root, "models", "Qwen2-1.5B")
+    sft_data_path = os.path.join(_root, "data", "sft_data_coig.json")
+    output_dir = os.path.join(_root, "qwen2_1.5b_mixed_coig")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
@@ -222,24 +381,36 @@ def main():
     model = Qwen2ForCausalLM.from_pretrained(base_model_path).to(device)
 
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
+    batch_size = 10
     sft_dataset = SFTJsonDataset(sft_data_path, tokenizer)
     sft_dataloader = DataLoader(
         sft_dataset,
-        batch_size=10,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         collate_fn=lambda b: sft_collate_fn(b, pad_token_id=pad_token_id),
     )
     ppo_dataset = PromptDataset(sft_data_path)
-    ppo_dataloader = DataLoader(ppo_dataset, batch_size=10, shuffle=True, num_workers=0)
+    ppo_dataloader = DataLoader(ppo_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
-    num_rounds = 2  # SFT → PPO → SFT → PPO（两轮）
-    sft_steps_per_round = 2
-    ppo_steps_per_round = 2
+    # ---------- 训练规模 ----------
+    # num_rounds：SFT→PPO 循环次数（例如 3 表示 SFT→PPO→SFT→PPO→SFT→PPO）
+    # sft_steps_per_round / ppo_steps_per_round：每轮里各跑多少步（每步用 batch_size 条数据）
+    #
+    # 显存：只要 batch_size、序列长、模型不变，增大步数/轮数不会提高「峰值显存」，
+    #       只会线性增加总训练时间。若仍 OOM，应减小 batch 或 max_length，而不是减轮数。
+    num_rounds = 5
+    sft_steps_per_round = 200
+    ppo_steps_per_round = 20
+
+    # 若希望「每轮 SFT / PPO 各扫一遍当前 JSON 全量」，可改用下面两行（注释掉上面两个 per_round 数字）：
+    # sft_steps_per_round = max(1, (len(sft_dataset) + batch_size - 1) // batch_size)
+    # ppo_steps_per_round = max(1, (len(ppo_dataset) + batch_size - 1) // batch_size)
 
     print("SFT 与 RL 交替训练（单 policy，生成时存 log π_old，全程 GPU）")
+    print(f"num_rounds={num_rounds}, sft_steps/round={sft_steps_per_round}, ppo_steps/round={ppo_steps_per_round}")
     for r in range(num_rounds):
         print(f"--- Round {r + 1}/{num_rounds} ---")
         run_sft_phase(model, tokenizer, sft_dataloader, optimizer, device, sft_steps_per_round)
