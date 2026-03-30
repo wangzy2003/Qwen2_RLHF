@@ -6,6 +6,7 @@
 
 用法示例:
   python scripts/eval_plot.py --model qwen2_1.5b_mixed_coig --data data/sft_data_coig.json --out figures/eval_run1
+  python scripts/eval_plot.py ... --plot-lang zh   # 本机有中文字体时再用中文图
   python scripts/eval_plot.py --model models/Qwen2-0.5B --max-samples 30 --greedy
 """
 import argparse
@@ -107,6 +108,25 @@ def try_rouge_l(preds: List[str], refs: List[str]) -> Optional[List[float]]:
     return scores
 
 
+def _matplot_zh_font() -> None:
+    """Pick a CJK-capable font if installed (many Linux cloud images have none)."""
+    import matplotlib.font_manager as fm
+    import matplotlib.pyplot as plt
+
+    names = (
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "WenQuanYi Micro Hei",
+    )
+    installed = {f.name for f in fm.fontManager.ttflist}
+    for n in names:
+        if n in installed:
+            plt.rcParams["font.sans-serif"] = [n]
+            return
+
+
 def plot_all(
     out_dir: Path,
     lengths: List[int],
@@ -114,39 +134,70 @@ def plot_all(
     d2: List[float],
     rep_r: List[float],
     rouge_l: Optional[List[float]],
+    plot_lang: str = "en",
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # 中文字体：Windows 常见黑体；失败则用默认（图例仍可用英文）
-    plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
+    # 中文标题在无中文字体时（如云服务器）会变成方框；默认用英文标签最稳。
+    if plot_lang.lower() == "zh":
+        _matplot_zh_font()
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if plot_lang.lower() == "zh":
+        t_len = "生成长度分布（字符数）"
+        x_len, y_len = "字符长度", "样本数"
+        names = ["Distinct-1", "Distinct-2", "最大单字占比"]
+        t_bar = "多样性（高更好）与重复度（低更好）"
+        t_r = "ROUGE-L（F1）均值"
+        t_r2 = "与参考答案 ROUGE-L（F1）"
+        t_s1 = "生成长度分布"
+        t_s2 = "Distinct / 重复"
+        t_miss = "未安装 rouge-score\n或未计算"
+        t_line = "各样本生成长度（评测顺序）"
+        x_idx, y_chars = "样本序号", "字符长度"
+        t_all = "模型评测汇总"
+        rlabel = ["ROUGE-L 均值"]
+    else:
+        t_len = "Generation length (#chars)"
+        x_len, y_len = "Chars", "Count"
+        names = ["Distinct-1", "Distinct-2", "Top-char ratio"]
+        t_bar = "Diversity (higher) vs char repetition (lower is better)"
+        t_r = "Mean ROUGE-L (F1)"
+        t_r2 = "ROUGE-L vs reference (F1)"
+        t_s1 = "Length distribution"
+        t_s2 = "Distinct / repetition"
+        t_miss = "ROUGE not computed\n(install rouge-score?)"
+        t_line = "Length per sample (order)"
+        x_idx, y_chars = "Sample index", "Chars"
+        t_all = "Evaluation summary"
+        rlabel = ["ROUGE-L"]
 
     # 1) 生成长度分布
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(lengths, bins=min(20, max(5, len(lengths) // 3)), color="steelblue", edgecolor="white")
-    ax.set_title("生成长度分布（字符数）")
-    ax.set_xlabel("字符长度")
-    ax.set_ylabel("样本数")
+    ax.set_title(t_len)
+    ax.set_xlabel(x_len)
+    ax.set_ylabel(y_len)
     fig.tight_layout()
     fig.savefig(out_dir / "eval_lengths_hist.png", dpi=150)
     plt.close(fig)
 
-    # 2) 多样性 / 重复 条形图
-    fig, ax = plt.subplots(figsize=(6, 4))
-    names = ["Distinct-1", "Distinct-2", "1-最大字频占比"]
     means = [
         sum(d1) / len(d1),
         sum(d2) / len(d2),
         sum(rep_r) / len(rep_r),
     ]
+
+    # 2) 多样性 / 重复 条形图
+    fig, ax = plt.subplots(figsize=(6, 4))
     ax.bar(names, means, color=["#4c78a8", "#f58518", "#e45756"])
     ax.set_ylim(0, 1.05)
-    ax.set_title("多样性（越高越好）与字符重复度（越低越好）")
+    ax.set_title(t_bar)
     fig.tight_layout()
     fig.savefig(out_dir / "eval_distinct_repeat.png", dpi=150)
     plt.close(fig)
@@ -154,9 +205,9 @@ def plot_all(
     # 3) ROUGE-L（若有）
     if rouge_l:
         fig, ax = plt.subplots(figsize=(5, 4))
-        ax.bar(["ROUGE-L 均值"], [sum(rouge_l) / len(rouge_l)], color="#54a24b")
+        ax.bar(rlabel, [sum(rouge_l) / len(rouge_l)], color="#54a24b")
         ax.set_ylim(0, 1.0)
-        ax.set_title("与参考答案 ROUGE-L（F1）")
+        ax.set_title(t_r2)
         fig.tight_layout()
         fig.savefig(out_dir / "eval_rougeL.png", dpi=150)
         plt.close(fig)
@@ -164,22 +215,22 @@ def plot_all(
     # 4) 汇总四宫格
     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
     axes[0, 0].hist(lengths, bins=min(20, max(5, len(lengths) // 3)), color="steelblue", edgecolor="white")
-    axes[0, 0].set_title("生成长度分布")
+    axes[0, 0].set_title(t_s1)
     axes[0, 1].bar(names, means, color=["#4c78a8", "#f58518", "#e45756"])
     axes[0, 1].set_ylim(0, 1.05)
-    axes[0, 1].set_title("Distinct / 重复")
+    axes[0, 1].set_title(t_s2)
     if rouge_l:
         axes[1, 0].bar(["ROUGE-L"], [sum(rouge_l) / len(rouge_l)], color="#54a24b")
         axes[1, 0].set_ylim(0, 1.0)
-        axes[1, 0].set_title("ROUGE-L")
+        axes[1, 0].set_title(t_r)
     else:
-        axes[1, 0].text(0.5, 0.5, "未安装 rouge-score\n或未计算", ha="center", va="center")
+        axes[1, 0].text(0.5, 0.5, t_miss, ha="center", va="center")
         axes[1, 0].set_axis_off()
     axes[1, 1].plot(range(1, len(lengths) + 1), lengths, marker="o", markersize=3, linestyle="-")
-    axes[1, 1].set_title("各样本生成长度（按评测顺序）")
-    axes[1, 1].set_xlabel("样本序号")
-    axes[1, 1].set_ylabel("字符长度")
-    fig.suptitle("模型评测汇总", fontsize=14)
+    axes[1, 1].set_title(t_line)
+    axes[1, 1].set_xlabel(x_idx)
+    axes[1, 1].set_ylabel(y_chars)
+    fig.suptitle(t_all, fontsize=14)
     fig.tight_layout()
     fig.savefig(out_dir / "eval_summary.png", dpi=150)
     plt.close(fig)
@@ -194,6 +245,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-new-tokens", type=int, default=160)
     ap.add_argument("--greedy", action="store_true", help="贪心解码（默认识别为采样）")
+    ap.add_argument(
+        "--plot-lang",
+        choices=("en", "zh"),
+        default="en",
+        help="图表文字：en=英文（任意环境可显示）；zh=中文（需系统有中文字体，否则仍可能方块）",
+    )
     args = ap.parse_args()
 
     root = _root_dir()
@@ -269,7 +326,7 @@ def main() -> None:
     print("指标:", json.dumps(summary, ensure_ascii=False, indent=2))
 
     try:
-        plot_all(out_dir, lengths, d1s, d2s, rep_rs, rouge_l)
+        plot_all(out_dir, lengths, d1s, d2s, rep_rs, rouge_l, plot_lang=args.plot_lang)
     except ImportError:
         print("未安装 matplotlib，跳过出图。请执行: pip install matplotlib")
 
