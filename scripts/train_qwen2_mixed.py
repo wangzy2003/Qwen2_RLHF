@@ -245,7 +245,7 @@ def generate_responses_with_logprobs(
     model, tokenizer, prompts: List[str], device: torch.device,
     max_input_length: int = 256, max_new_tokens: int = 64,
 ):
-    """生成回复并在每步记录采样 token 的 log 概率，返回 log_probs_old（无需 old_policy）。"""
+    """生成回复并记录逐 token 的旧策略 log 概率（无需 old_policy）。"""
     model.eval()
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
     encoded = [tokenizer(p, return_tensors="pt", truncation=True, max_length=max_input_length) for p in prompts]
@@ -275,39 +275,43 @@ def generate_responses_with_logprobs(
         input_ids = torch.cat([input_ids, next_tokens], dim=1)
         attention_mask = torch.cat([attention_mask, torch.ones_like(next_tokens, device=device)], dim=1)
 
-    log_probs_old = torch.stack(all_token_logprobs, dim=1).mean(dim=1)
+    # [B, T]，T=max_new_tokens；逐 token 的旧策略 logprob
+    old_token_logprobs = torch.stack(all_token_logprobs, dim=1)
     texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-    return input_ids, attention_mask, prompt_lens, texts, log_probs_old
+    return input_ids, attention_mask, prompt_lens, texts, old_token_logprobs
 
 
-def sequence_logprob(model, input_ids, attention_mask, prompt_lens: List[int], device: torch.device):
+def sequence_token_logprobs(model, input_ids, attention_mask, gen_len: int, device: torch.device):
+    """对固定已生成序列，返回逐 token 的当前策略 logprob: [B, gen_len]。"""
     model.eval()
     outputs = model(input_ids=input_ids.to(device), attention_mask=attention_mask.to(device))
     logits = outputs.logits
     log_probs = F.log_softmax(logits, dim=-1)
-    batch_size, seq_len, _ = log_probs.size()
-    logprobs_per_sample = []
-    for i in range(batch_size):
-        pl = prompt_lens[i]
-        if pl >= seq_len - 1:
-            logprobs_per_sample.append(torch.tensor(-10.0, device=device))
-            continue
-        resp_input_ids = input_ids[i, pl + 1 :].to(device)
-        resp_log_probs = log_probs[i, pl : seq_len - 1, :]
-        token_log_probs = resp_log_probs.gather(dim=-1, index=resp_input_ids.unsqueeze(-1)).squeeze(-1)
-        logprobs_per_sample.append(token_log_probs.mean())
-    return torch.stack(logprobs_per_sample, dim=0)
+    _, seq_len, _ = log_probs.size()
+    if gen_len <= 0 or gen_len >= seq_len:
+        raise ValueError(f"invalid gen_len={gen_len} for seq_len={seq_len}")
+
+    # 生成段统一位于序列尾部：目标 token 在 [start, seq_len-1]，对应 logits 位置 [start-1, seq_len-2]
+    start = seq_len - gen_len
+    target_ids = input_ids[:, start:seq_len].to(device)             # [B, T]
+    step_log_probs = log_probs[:, start - 1 : seq_len - 1, :]       # [B, T, V]
+    token_log_probs = step_log_probs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+    return token_log_probs
 
 
 def ppo_update_step(policy_model, tokenizer, prompts: List[str], device, optimizer,
                     kl_coef: float = 0.1, clip_range: float = 0.2) -> Dict[str, float]:
     with torch.no_grad():
-        input_ids, attention_mask, prompt_lens, texts, logprob_old = generate_responses_with_logprobs(
+        input_ids, attention_mask, prompt_lens, texts, old_token_logprobs = generate_responses_with_logprobs(
             policy_model, tokenizer, prompts, device=device)
     rewards = [compute_reward(p, t) for p, t in zip(prompts, texts)]
     rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
     policy_model.train()
-    logprob_new = sequence_logprob(policy_model, input_ids, attention_mask, prompt_lens, device)
+    gen_len = old_token_logprobs.size(1)
+    new_token_logprobs = sequence_token_logprobs(policy_model, input_ids, attention_mask, gen_len, device)
+    # PPO 比率沿用样本级均值 logprob，避免改动过大；KL 使用逐 token 更标准近似
+    logprob_old = old_token_logprobs.mean(dim=1)
+    logprob_new = new_token_logprobs.mean(dim=1)
     advantages = rewards_t - rewards_t.mean()
     std = advantages.std(unbiased=False)
     if std > 1e-8:
@@ -316,7 +320,7 @@ def ppo_update_step(policy_model, tokenizer, prompts: List[str], device, optimiz
     unclipped = ratio * advantages
     clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
     ppo_loss = -torch.mean(torch.min(unclipped, clipped))
-    kl = torch.mean(logprob_old - logprob_new)
+    kl = torch.mean(old_token_logprobs - new_token_logprobs)
     loss = ppo_loss + kl_coef * kl
     optimizer.zero_grad()
     loss.backward()
@@ -402,7 +406,7 @@ def main():
     # 显存：只要 batch_size、序列长、模型不变，增大步数/轮数不会提高「峰值显存」，
     #       只会线性增加总训练时间。若仍 OOM，应减小 batch 或 max_length，而不是减轮数。
     num_rounds = 5
-    sft_steps_per_round = 200
+    sft_steps_per_round = 100
     ppo_steps_per_round = 20
 
     # 若希望「每轮 SFT / PPO 各扫一遍当前 JSON 全量」，可改用下面两行（注释掉上面两个 per_round 数字）：
