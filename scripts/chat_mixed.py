@@ -36,6 +36,27 @@ def strip_optional_user_prefix(text: str) -> str:
     return t
 
 
+def _truncate_by_stop_markers(text: str) -> str:
+    """命中常见数据集模板标记时截断，避免回答后继续编题。"""
+    stops = (
+        "\n用户:",
+        "\n用户：",
+        "\nInput:",
+        "\nAssistant:",
+        "\nAnswer:",
+        "\n答案",
+        "\nA.",
+        "\nB.",
+        "\nC.",
+        "\nD.",
+    )
+    out = text
+    for stop in stops:
+        if stop in out:
+            out = out.split(stop, 1)[0].strip()
+    return out
+
+
 def main():
     # 项目根 = scripts 的上一级，与 train_qwen2_mixed 的 output_dir 同级（切勿少一层 dirname）
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +68,8 @@ def main():
     kw = {"local_files_only": True, "trust_remote_code": True}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    use_greedy = os.environ.get("CHAT_GREEDY", "").strip() in ("1", "true", "yes")
+    use_greedy = os.environ.get("CHAT_GREEDY", "1").strip().lower() in ("1", "true", "yes")
+    max_new_tokens = int(os.environ.get("CHAT_MAX_NEW_TOKENS", "64"))
 
     print(f"加载模型与分词器: {model_dir} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_dir, **kw)
@@ -55,7 +77,11 @@ def main():
     model.eval()
 
     print("输入问题后回车生成回答，输入 quit 或 exit 退出。")
-    print("若出现复读 SFT/助手 等：设环境变量 CHAT_GREEDY=1 试贪心解码；或换用仅 SFT 的 checkpoint。\n")
+    print(
+        f"当前解码: {'greedy' if use_greedy else 'sampling'}; "
+        f"max_new_tokens={max_new_tokens} "
+        "(可用 CHAT_GREEDY / CHAT_MAX_NEW_TOKENS 调整)\n"
+    )
     while True:
         try:
             prompt = input("你: ").strip()
@@ -83,7 +109,7 @@ def main():
         gen_kw = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=160,
+            max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id or eos_id,
             eos_token_id=eos_id,
             repetition_penalty=1.5,
@@ -104,10 +130,7 @@ def main():
         gen_ids = output_ids[:, input_ids.size(1) :]
         reply = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
         reply = _truncate_repeated_spans(reply)
-        # 若模型又编出下一轮「用户:」，截断，避免整段胡话
-        for stop in ("\n用户:", "\n用户："):
-            if stop in reply:
-                reply = reply.split(stop, 1)[0].strip()
+        reply = _truncate_by_stop_markers(reply)
         print("模型:", reply)
         print()
 
