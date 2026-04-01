@@ -173,7 +173,9 @@ def sft_collate_fn(batch, pad_token_id: int = 0):
 # ---------- PPO 用：reward、生成、logprob、单步更新 ----------
 def compute_reward(prompt: str, response: str) -> float:
     """
-    启发式奖励。旧版强依赖「RLHF/SFT」等关键词，与 COIG 等开放域数据严重错配。
+    启发式奖励。response 应为「助手回复」纯文本（勿含用户侧 prompt）。
+
+    旧版强依赖「RLHF/SFT」等关键词，与 COIG 等开放域数据严重错配。
 
     当前设计（可按实验调权重）：
       - 平滑长度：过短/过长渐近惩罚，避免硬阈值抖动
@@ -239,6 +241,11 @@ def compute_reward(prompt: str, response: str) -> float:
     return float(length_score + repeat_penalty + lang_bonus + bad_score + domain_bonus)
 
 
+def format_rollout_prompt(prompt: str) -> str:
+    """与 SFTJsonDataset / eval_plot.generate_one 一致的前缀，避免 PPO 在「裸 prompt」上rollout而分布错位。"""
+    return f"用户: {prompt.strip()}\n助手:"
+
+
 @torch.no_grad()
 def generate_responses_with_logprobs(
     model, tokenizer, prompts: List[str], device: torch.device,
@@ -247,7 +254,10 @@ def generate_responses_with_logprobs(
     """生成回复并记录逐 token 的旧策略 log 概率（无需 old_policy）。"""
     model.eval()
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
-    encoded = [tokenizer(p, return_tensors="pt", truncation=True, max_length=max_input_length) for p in prompts]
+    encoded = [
+        tokenizer(format_rollout_prompt(p), return_tensors="pt", truncation=True, max_length=max_input_length)
+        for p in prompts
+    ]
     max_pl = max(enc["input_ids"].size(1) for enc in encoded)
     prompt_lens = [enc["input_ids"].size(1) for enc in encoded]
     input_ids = []
@@ -276,8 +286,10 @@ def generate_responses_with_logprobs(
 
     # [B, T]，T=max_new_tokens；逐 token 的旧策略 logprob
     old_token_logprobs = torch.stack(all_token_logprobs, dim=1)
-    texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-    return input_ids, attention_mask, prompt_lens, texts, old_token_logprobs
+    # 仅解码助手续写段（与 compute_reward 语义一致）；整段见 input_ids
+    gen_ids = input_ids[:, max_pl:]
+    texts_gen_only = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+    return input_ids, attention_mask, prompt_lens, texts_gen_only, old_token_logprobs, max_pl
 
 
 def sequence_token_logprobs(model, input_ids, attention_mask, gen_len: int, device: torch.device):
@@ -308,8 +320,8 @@ def ppo_update_step(policy_model, tokenizer, prompts: List[str], device, optimiz
     ppo_epochs = max(1, int(os.environ.get("PPO_EPOCHS", "4")))
 
     with torch.no_grad():
-        input_ids, attention_mask, prompt_lens, texts, old_token_logprobs = generate_responses_with_logprobs(
-            policy_model, tokenizer, prompts, device=device)
+        input_ids, attention_mask, prompt_lens, texts, old_token_logprobs, _padded_pl = (
+            generate_responses_with_logprobs(policy_model, tokenizer, prompts, device=device))
     old_token_logprobs = old_token_logprobs.detach()
 
     rewards = [compute_reward(p, t) for p, t in zip(prompts, texts)]
@@ -408,9 +420,9 @@ def main():
     _root = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     prepare_sensitive_lexicon(Path(_root))
 
-    base_model_path = os.path.join(_root, "models", "Qwen2-1.5B")
+    base_model_path = os.path.join(_root, "models", "Qwen3-1.7B")
     sft_data_path = os.path.join(_root, "data", "sft_data_coig.json")
-    output_dir = os.path.join(_root, "qwen2_1.5b_mixed_coig")
+    output_dir = os.path.join(_root, "qwen3_1.7b_mixed_coig")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
