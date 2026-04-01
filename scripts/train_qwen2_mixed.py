@@ -16,8 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ---------- 自动敏感词：下载词库 + 子串匹配（非「理解语义」的 AI 判别）----------
@@ -125,7 +124,7 @@ def _english_profanity_hit(text: str) -> bool:
 
 # ---------- 数据：SFT 用 prompt+response，PPO 只用 prompt ----------
 class SFTJsonDataset(Dataset):
-    def __init__(self, json_path: str, tokenizer, max_length: int = 512):
+    def __init__(self, json_path: str, tokenizer, max_length: int = 256):
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         self.examples = []#存每条样本的tokenized结果
         for item in data:#遍历每条样本
@@ -301,32 +300,70 @@ def sequence_token_logprobs(model, input_ids, attention_mask, gen_len: int, devi
 
 def ppo_update_step(policy_model, tokenizer, prompts: List[str], device, optimizer,
                     kl_coef: float = 0.1, clip_range: float = 0.2) -> Dict[str, float]:
+    """
+    标准 PPO 要点：采样时刻的行为策略 logprob 固定（detach），在同一批轨迹上做多轮更新，
+    使当前策略与采样时策略分离，ratio / kl 不再恒为 0。
+    轮数：环境变量 PPO_EPOCHS（默认 4）；显存紧张可设为 2。
+    """
+    ppo_epochs = max(1, int(os.environ.get("PPO_EPOCHS", "4")))
+
     with torch.no_grad():
         input_ids, attention_mask, prompt_lens, texts, old_token_logprobs = generate_responses_with_logprobs(
             policy_model, tokenizer, prompts, device=device)
+    old_token_logprobs = old_token_logprobs.detach()
+
     rewards = [compute_reward(p, t) for p, t in zip(prompts, texts)]
     rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-    policy_model.train()
-    gen_len = old_token_logprobs.size(1)
-    new_token_logprobs = sequence_token_logprobs(policy_model, input_ids, attention_mask, gen_len, device)
-    # PPO 比率沿用样本级均值 logprob，避免改动过大；KL 使用逐 token 更标准近似
-    logprob_old = old_token_logprobs.mean(dim=1)
-    logprob_new = new_token_logprobs.mean(dim=1)
     advantages = rewards_t - rewards_t.mean()
     std = advantages.std(unbiased=False)
     if std > 1e-8:
         advantages = advantages / std
-    ratio = torch.exp(logprob_new - logprob_old)
-    unclipped = ratio * advantages
-    clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
-    ppo_loss = -torch.mean(torch.min(unclipped, clipped))
-    kl = torch.mean(old_token_logprobs - new_token_logprobs)
-    loss = ppo_loss + kl_coef * kl
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
-    optimizer.step()
-    return {"loss": float(loss.item()), "reward_mean": float(rewards_t.mean().item()), "kl": float(kl.item())}
+
+    gen_len = old_token_logprobs.size(1)
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+
+    last_loss, last_kl = 0.0, 0.0
+    policy_model.train()
+
+    for _ in range(ppo_epochs):
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                new_token_logprobs = sequence_token_logprobs(
+                    policy_model, input_ids, attention_mask, gen_len, device
+                )
+                old_f = old_token_logprobs.float()
+                new_f = new_token_logprobs.float()
+                logprob_old = old_f.mean(dim=1)
+                logprob_new = new_f.mean(dim=1)
+                ratio = torch.exp(logprob_new - logprob_old)
+                unclipped = ratio * advantages
+                clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
+                ppo_loss = -torch.mean(torch.min(unclipped, clipped))
+                kl = torch.mean(old_f - new_f)
+                loss = ppo_loss + kl_coef * kl
+        else:
+            new_token_logprobs = sequence_token_logprobs(
+                policy_model, input_ids, attention_mask, gen_len, device
+            )
+            old_f = old_token_logprobs.float()
+            new_f = new_token_logprobs.float()
+            logprob_old = old_f.mean(dim=1)
+            logprob_new = new_f.mean(dim=1)
+            ratio = torch.exp(logprob_new - logprob_old)
+            unclipped = ratio * advantages
+            clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
+            ppo_loss = -torch.mean(torch.min(unclipped, clipped))
+            kl = torch.mean(old_f - new_f)
+            loss = ppo_loss + kl_coef * kl
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
+        optimizer.step()
+        last_loss = float(loss.item())
+        last_kl = float(kl.item())
+
+    return {"loss": last_loss, "reward_mean": float(rewards_t.mean().item()), "kl": last_kl}
 
 
 # ---------- 交替训练：单轮 SFT 阶段 / 单轮 PPO 阶段 ----------
@@ -382,11 +419,11 @@ def main():
 
     # 从基座加载，只保留一个 policy（生成时存 log π_old，无需 old_policy）
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
-    model = Qwen2ForCausalLM.from_pretrained(base_model_path).to(device)
+    model = AutoModelForCausalLM.from_pretrained(base_model_path).to(device)
 
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
     batch_size = 10
-    sft_dataset = SFTJsonDataset(sft_data_path, tokenizer)
+    sft_dataset = SFTJsonDataset(sft_data_path, tokenizer, max_length=256)
     sft_dataloader = DataLoader(
         sft_dataset,
         batch_size=batch_size,
@@ -403,8 +440,8 @@ def main():
     # num_rounds：SFT→PPO 循环次数（例如 3 表示 SFT→PPO→SFT→PPO→SFT→PPO）
     # sft_steps_per_round / ppo_steps_per_round：每轮里各跑多少步（每步用 batch_size 条数据）
     #
-    # 显存：只要 batch_size、序列长、模型不变，增大步数/轮数不会提高「峰值显存」，
-    #       只会线性增加总训练时间。若仍 OOM，应减小 batch 或 max_length，而不是减轮数。
+    # 显存：batch_size、序列长、模型不变时，增大 sft/ppo 的「外层步数」一般不提高峰值显存。
+    #       环境变量 PPO_EPOCHS 会在每个 PPO 步内多算几次前向+反传，时间线性增加；OOM 时可减小 PPO_EPOCHS、batch 或 max_length。
     num_rounds = 5
     sft_steps_per_round = 100
     ppo_steps_per_round = 20
@@ -413,8 +450,11 @@ def main():
     # sft_steps_per_round = max(1, (len(sft_dataset) + batch_size - 1) // batch_size)
     # ppo_steps_per_round = max(1, (len(ppo_dataset) + batch_size - 1) // batch_size)
 
-    print("SFT 与 RL 交替训练（单 policy，生成时存 log π_old，全程 GPU）")
-    print(f"num_rounds={num_rounds}, sft_steps/round={sft_steps_per_round}, ppo_steps/round={ppo_steps_per_round}")
+    print("SFT 与 RL 交替训练（单 policy；PPO 同批多轮更新见环境变量 PPO_EPOCHS）")
+    print(
+        f"num_rounds={num_rounds}, sft_steps/round={sft_steps_per_round}, "
+        f"ppo_steps/round={ppo_steps_per_round}, PPO_EPOCHS={os.environ.get('PPO_EPOCHS', '4')}"
+    )
     for r in range(num_rounds):
         print(f"--- Round {r + 1}/{num_rounds} ---")
         run_sft_phase(model, tokenizer, sft_dataloader, optimizer, device, sft_steps_per_round)
